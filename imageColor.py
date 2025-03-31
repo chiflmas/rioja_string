@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict, Union
 from torchtyping import TensorType as TT
 import einops
+import torch.nn.functional as F
 
 # A4 = (595.2755905511812, 841.8897637795277)
 # A4 = (596, 870)
@@ -67,7 +68,8 @@ class ThreadArtColorParams():
     seed: int = 0
     pixels_per_batch: int = 32
     num_overlap_rows: int = 6
-
+    supersampling_factor: int = 1
+    
     def __post_init__(self):
 
         self.color_names = list(self.palette.keys())
@@ -103,7 +105,8 @@ class ThreadArtColorParams():
             other_colors_weighting=0,
             dithering_params=["clamp"],
             pixels_per_batch=self.pixels_per_batch, 
-            num_overlap_rows=self.num_overlap_rows
+            num_overlap_rows=self.num_overlap_rows,
+            #supersampling_factor=self.supersampling_factor
         )
 
     def get_img(self):
@@ -380,6 +383,48 @@ def display_img(im_list, width):
         fig.show(config={'doubleClick': 'reset', 'displayModeBar': False})
 
 
+def upsample_image(img, factor):
+    """
+    Upsamples an image using bilinear interpolation.
+    """
+    if img.ndim == 2:
+        img = img.unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+        # Convert the image to float before interpolation
+        img = img.type(t.float32) #added line to change the tensor to float type
+        up_img = F.interpolate(img, scale_factor=factor, mode='bilinear', align_corners=False)
+        return up_img.squeeze(0).squeeze(0)
+    elif img.ndim == 3:
+        img = img.unsqueeze(0)  # [1,C,H,W]
+        up_img = F.interpolate(img, scale_factor=factor, mode='bilinear', align_corners=False)
+        return up_img.squeeze(0)
+    else:
+        raise ValueError(f"img has invalid number of dimensions: {img.ndim}")
+
+def downsample_image(img: t.Tensor, factor: int) -> t.Tensor:
+    # Uses average pooling as a box filter for downsampling.
+    if img.ndim == 2:
+        img = img.unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+        img = img.type(t.float32)
+        down_img = F.avg_pool2d(img, kernel_size=factor)
+        return down_img.squeeze(0).squeeze(0)
+    elif img.ndim == 3:
+        img = img.permute(2, 0, 1).unsqueeze(0)  # [1,3,H,W]
+        down_img = F.avg_pool2d(img, kernel_size=factor)
+        return down_img.squeeze(0).permute(1, 2, 0)
+    else:
+        return img
+
+# --- New function to simulate removal (the inverse of subtracting darkness) ---
+def simulate_removal(m_image: t.Tensor, edge: Tuple[int, int], darkness: float, t_pixels: t.Tensor) -> t.Tensor:
+    new_m = m_image.clone()
+    # Retrieve the pixel coordinates for this edge
+    pixels = t_pixels[edge[0], edge[1]]
+    valid = (pixels.abs().sum(dim=0) != 0)
+    if valid.sum() > 0:
+        coords = pixels[:, valid].long()  # shape: [2, num_valid_pixels]
+        new_m[coords[0], coords[1]] += darkness
+    return new_m
+
 # Displays a grid of all the relevant images: original, monochrome, dithered, color-decomposed, and optionally the weighting (used in Jupyter Notebook)
 def display_splashpage(I, size, w=False, d_coords=None, offset_pixels=1, coord_color=(255, 0, 0)):
 
@@ -499,12 +544,13 @@ def choose_and_subtract_best_line(m_image: t.Tensor, i: int, w: Optional[t.Tenso
 
     return best_j
 
+# --- Modified create_canvas function with supersampling and iterative removal phase ---
 def create_canvas(I: Img, args: ThreadArtColorParams):
     """
-    n_consecutive is to break up the lines, so they don't reveal IP when sent as an svg
-    full_sweep_freq gives me stats (currently it's set up to return stats that generate line plots of score as you move one end of a line, trying to understand conceptually how alg works)
+    Creates the canvas by choosing and subtracting lines.
+    Now includes supersampling for the mono images and an iterative
+    edge removal phase to refine the solution.
     """
-
     assert len(I.palette) == len(args.n_lines_per_color), "Palette and lines per color don't match. Did you change the palette without re-updating params?"
     
     t0 = time.time()
@@ -515,40 +561,57 @@ def create_canvas(I: Img, args: ThreadArtColorParams):
         darkness_dict = defaultdict(lambda: args.darkness)
     else:
         darkness_dict = args.darkness
+
+    # --- Supersampling stage for mono images ---
+    mono_image_dict = {}
+    for color, mono_image in I.mono_images_dict.items():
+        if args.supersampling_factor > 1:
+            high_res = upsample_image(mono_image, args.supersampling_factor)
+            high_res_blurred = blur_image(high_res, args.blur_rad)
+            mono_image_dict[color] = downsample_image(high_res_blurred, args.supersampling_factor)
+        else:
+            mono_image_dict[color] = blur_image(mono_image, args.blur_rad)
     
-    mono_image_dict = {color: blur_image(mono_image, args.blur_rad) for color, mono_image in I.mono_images_dict.items()}
-    
-    # setting a random seed at the start of this function ensures the lines will be the same (unless the parameters change)
     t.manual_seed(args.seed)
     np.random.seed(args.seed)
 
     max_color_name_len = max(len(i) for i in I.palette)
     
-    for i, (color_name, color_value) in enumerate(I.palette.items()):
-
-        n_lines = args.n_lines_per_color[i]
+    for color_index, (color_name, color_value) in enumerate(I.palette.items()):
+        n_lines = args.n_lines_per_color[color_index]
         m_image = mono_image_dict[color_name]
         line_dict[color_name] = []
         i = list(args.d_joined.keys())[t.randint(0, len(args.d_joined), (1,))]
           
-        for n in range(n_lines): #, desc=f"Progress for color {color}"): #, leave=False):
-
-            # Choose and add line
+        for n in range(n_lines):
+            # Choose and add line (greedy addition)
             j = choose_and_subtract_best_line(m_image, i, w, args.n_random_lines, darkness_dict[color_name], args.d_joined, args.t_pixels)
             line_dict[color_name].append((i, j))
-            # Get the outgoing node
             i = j+1 if (j % 2 == 0) else j-1
 
             if args.n_consecutive != 0 and ((n+1) % args.n_consecutive) == 0:
                 i = list(args.d_joined.keys())[t.randint(0, len(args.d_joined), (1,))]
-
-            if n+1 % 50 == 0:
+                
+            if (n+1) % 50 == 0:
                 print(f"Color {color_name+',':{max_color_name_len+1}} line {n+1:4}/{n_lines:<4} done.", end="\r")
-
         print(f"Color {color_name+',':{max_color_name_len+1}} line {n_lines:4}/{n_lines:<4} done.")
+        
+        # --- Iterative edge removal phase ---
+        removal_improvement = True
+        while removal_improvement:
+            removal_improvement = False
+            current_error = m_image.sum().item()  # Objective: total residual brightness
+            for edge_idx in reversed(range(len(line_dict[color_name]))):
+                candidate_edge = line_dict[color_name][edge_idx]
+                new_m = simulate_removal(m_image, candidate_edge, darkness_dict[color_name], args.t_pixels)
+                new_error = new_m.sum().item()
+                if new_error < current_error:
+                    line_dict[color_name].pop(edge_idx)
+                    m_image = new_m
+                    current_error = new_error
+                    removal_improvement = True
 
     print(f"total time = {time.time() - t0:.2f}")
-
     return line_dict
 
 
